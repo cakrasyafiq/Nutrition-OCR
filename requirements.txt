@@ -1,2 +1,2 @@
 paddlepaddle
-paddleocr
+"paddleocr[all]"
