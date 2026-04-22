@@ -3,6 +3,8 @@ from pathlib import Path
 import json
 import csv
 import re
+import cv2
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # OCR setup
@@ -15,10 +17,123 @@ ocr = PaddleOCR(
     use_textline_orientation=False,
 )
 
-input_image = Path("test_files/test_gizi_5.jpeg")
-output = ocr.predict(str(input_image))
+
+def preprocess_for_ocr(image_path: Path, output_dir: Path) -> Path:
+    """Preprocess input image to improve OCR detection/recognition quality."""
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+
+    # Upscale small images so thin characters become easier to detect.
+    h, w = image.shape[:2]
+    scale = 1.8 if max(h, w) < 1400 else 1.25
+    resized = cv2.resize(
+        image,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    # Preserve edges while reducing camera/compression noise.
+    denoised = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
+
+    # Boost local contrast to make faded print more legible.
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    contrast = clahe.apply(denoised)
+
+    # Adaptive threshold works better than global threshold for uneven lighting.
+    binarized = cv2.adaptiveThreshold(
+        contrast,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
+
+    # Light morphology to connect broken character strokes.
+    kernel = np.ones((2, 2), np.uint8)
+    processed = cv2.morphologyEx(binarized, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    preprocessed_path = output_dir / f"{image_path.stem}_preprocessed.png"
+    cv2.imwrite(str(preprocessed_path), processed)
+    return preprocessed_path
+
+input_image = Path("test_files/test_gizi_3.png")
 output_dir = Path("output")
 output_dir.mkdir(exist_ok=True)
+preprocessed_image = preprocess_for_ocr(input_image, output_dir)
+
+
+def run_ocr_extract_nutrition(source_image: Path, output_dir: Path):
+    """Run OCR for one source image and return extracted nutrition + diagnostics."""
+    output = list(ocr.predict(str(source_image)))
+
+    all_nutrition = []
+    all_scores = []
+
+    for res in output:
+        res.save_to_json(str(output_dir))
+
+        rec_texts = []
+        rec_scores = []
+        rec_polys = []
+
+        result_data = getattr(res, "res", None)
+        if isinstance(result_data, dict):
+            rec_texts = result_data.get("rec_texts", [])
+            rec_scores = result_data.get("rec_scores", [])
+            rec_polys = result_data.get("rec_polys", []) or result_data.get("dt_polys", [])
+
+        # Fallback: read generated JSON for this specific source image.
+        if not rec_texts:
+            json_path = output_dir / f"{source_image.stem}_res.json"
+            if json_path.exists():
+                with json_path.open("r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                rec_texts = payload.get("rec_texts", [])
+                rec_scores = payload.get("rec_scores", [])
+                rec_polys = payload.get("rec_polys", []) or payload.get("dt_polys", [])
+
+        if not rec_scores:
+            rec_scores = [1.0] * len(rec_texts)
+        if not rec_polys:
+            rec_polys = [
+                [[0, i * 100], [100, i * 100], [100, i * 100 + 50], [0, i * 100 + 50]]
+                for i in range(len(rec_texts))
+            ]
+
+        rows = group_into_rows(rec_polys, rec_texts, rec_scores)
+        nutrition = extract_nutrition_wide(rows)
+        all_nutrition.append(nutrition)
+        all_scores.extend(rec_scores)
+
+    # Keep best page for single-image usage by maximizing non-empty extracted values.
+    best_nutrition = {}
+    best_non_empty = -1
+    for nutrition in all_nutrition:
+        non_empty = sum(1 for v in nutrition.values() if str(v).strip())
+        if non_empty > best_non_empty:
+            best_non_empty = non_empty
+            best_nutrition = nutrition
+
+    avg_score = (sum(all_scores) / len(all_scores)) if all_scores else 0.0
+    return {
+        "nutrition": best_nutrition,
+        "avg_score": avg_score,
+        "non_empty": best_non_empty,
+    }
+
+
+def candidate_rank(candidate):
+    """Rank candidate by extraction completeness first, confidence second."""
+    nutrition = candidate["nutrition"]
+    return (
+        candidate["non_empty"],
+        len(nutrition),
+        candidate["avg_score"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +285,82 @@ def _extract_serving_count(text):
     return m.group(1) if m else ""
 
 
+def _extract_numeric_from_token(text):
+    """Extract numeric value from one OCR token, normalizing decimal commas."""
+    cleaned = text.replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)", cleaned)
+    return m.group(1) if m else ""
+
+
+def _looks_like_percent_token(text):
+    return bool(re.match(r"^\s*\d+(?:[\.,]\d+)?\s*%\s*$", text))
+
+
+def _is_numeric_like_token(text):
+    """Heuristic for value tokens such as 7g, 180kkal, 95mg, 0%."""
+    return bool(
+        re.match(
+            r"^\s*[:\-]?\s*\d+(?:[\.,]\d+)?\s*"
+            r"(?:kkal|kcal|kal|g|mg|mcg|ug|ml|l|%)?\s*$",
+            text,
+            re.I,
+        )
+    )
+
+
+def _find_key_boundary_index(row, patterns):
+    """Find the last token index that belongs to the nutrient key phrase."""
+    last_match_idx = -1
+    prefix_parts = []
+    for idx, entry in enumerate(row):
+        prefix_parts.append(entry["text"])
+        prefix_text = " ".join(prefix_parts).lower()
+        if any(re.search(pat, prefix_text) for pat in patterns):
+            last_match_idx = idx
+    return last_match_idx
+
+
+def _extract_aligned_value(row, col_name, patterns):
+    """Extract value from tokens to the right of the matched nutrient key."""
+    key_idx = _find_key_boundary_index(row, patterns)
+
+    if key_idx >= 0:
+        candidate_entries = row[key_idx + 1:]
+    else:
+        candidate_entries = row
+
+    candidate_texts = [e["text"].strip() for e in candidate_entries if e["text"].strip()]
+    merged_row = " ".join(e["text"] for e in row)
+
+    if col_name == "Takaran Saji":
+        candidate_merged = " ".join(candidate_texts)
+        return _extract_serving_value(candidate_merged) or _extract_serving_value(merged_row)
+
+    if col_name == "Sajian per Kemasan":
+        candidate_merged = " ".join(candidate_texts)
+        return _extract_serving_count(candidate_merged) or _extract_serving_count(merged_row)
+
+    # Prefer numeric-like tokens on the right side of the key.
+    for token in candidate_texts:
+        if _looks_like_percent_token(token):
+            continue
+        if _is_numeric_like_token(token):
+            value = _extract_numeric_from_token(token)
+            if value:
+                return value
+
+    # Fallback: any non-percent token containing digits on the right side.
+    for token in candidate_texts:
+        if _looks_like_percent_token(token):
+            continue
+        value = _extract_numeric_from_token(token)
+        if value:
+            return value
+
+    # Last fallback: extract from full row text.
+    return _extract_numeric(merged_row)
+
+
 def extract_nutrition_wide(rows):
     """Parse grouped OCR rows into a flat dict of nutrient -> value.
 
@@ -196,28 +387,8 @@ def extract_nutrition_wide(rows):
                 continue  # already found this nutrient
             for pat in patterns:
                 if re.search(pat, merged_lower):
-                    # Extract value based on column type
-                    if col_name == "Takaran Saji":
-                        val = _extract_serving_value(merged)
-                    elif col_name == "Sajian per Kemasan":
-                        val = _extract_serving_count(merged)
-                    else:
-                        # Collect all numeric-like tokens from the row
-                        # Prefer value+unit tokens (e.g. '7g', '0mg') over bare %
-                        all_texts = [e["text"] for e in row]
-                        val = ""
-                        for t in all_texts:
-                            # Skip percentage tokens
-                            if re.match(r"^\d+(\.\d+)?%$", t):
-                                continue
-                            # Skip tokens that are purely text (nutrient name parts)
-                            num = _extract_numeric(t)
-                            if num and re.search(r"\d", t):
-                                # Check it's a value token not a name token
-                                # (name tokens like "B12" contain digits too)
-                                if re.match(r"^\d+(?:\.\d+)?\s*[a-zA-Z]*$", t):
-                                    val = num
-                                    break
+                    # Value is picked from the same row, to the right of the key.
+                    val = _extract_aligned_value(row, col_name, patterns)
 
                     result[col_name] = val
                     used_rows.add(row_idx)
@@ -240,66 +411,43 @@ def extract_nutrition_wide(rows):
 
 
 # ---------------------------------------------------------------------------
-# Process results
+# Run OCR candidates and choose best extraction
 # ---------------------------------------------------------------------------
-for index, res in enumerate(output):
+original_candidate = run_ocr_extract_nutrition(input_image, output_dir)
+preprocessed_candidate = run_ocr_extract_nutrition(preprocessed_image, output_dir)
+
+best_candidate = max(
+    [original_candidate, preprocessed_candidate],
+    key=candidate_rank,
+)
+
+nutrition = best_candidate["nutrition"]
+
+# Keep result artifacts from the chosen source for easy visual inspection.
+chosen_source = input_image if best_candidate is original_candidate else preprocessed_image
+chosen_output = list(ocr.predict(str(chosen_source)))
+for res in chosen_output:
     res.save_to_img(str(output_dir))
-    res.save_to_json(str(output_dir))
 
-    input_path = Path(str(getattr(res, "input_path", input_image)))
-    base_name = input_path.stem if input_path.stem else "ocr_result"
 
-    # --- Load OCR data from the result or fallback to saved JSON -----------
-    rec_texts = []
-    rec_scores = []
-    rec_polys = []
+# ---------------------------------------------------------------------------
+# Write output from best candidate
+# ---------------------------------------------------------------------------
+csv_path = output_dir / f"{input_image.stem}.csv"
 
-    result_data = getattr(res, "res", None)
-    if isinstance(result_data, dict):
-        rec_texts = result_data.get("rec_texts", [])
-        rec_scores = result_data.get("rec_scores", [])
-        rec_polys = result_data.get("rec_polys", []) or result_data.get("dt_polys", [])
+headers = list(nutrition.keys())
+values = list(nutrition.values())
 
-    # Fallback: read the generated json
-    if not rec_texts:
-        json_path = output_dir / f"{base_name}_res.json"
-        if json_path.exists():
-            with json_path.open("r", encoding="utf-8") as f:
-                payload = json.load(f)
-            rec_texts = payload.get("rec_texts", [])
-            rec_scores = payload.get("rec_scores", [])
-            rec_polys = payload.get("rec_polys", []) or payload.get("dt_polys", [])
+with csv_path.open("w", encoding="utf-8", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(headers)
+    writer.writerow(values)
 
-    if not rec_scores:
-        rec_scores = [1.0] * len(rec_texts)
-    if not rec_polys:
-        rec_polys = [
-            [[0, i * 100], [100, i * 100], [100, i * 100 + 50], [0, i * 100 + 50]]
-            for i in range(len(rec_texts))
-        ]
-
-    # --- Group into rows and extract nutrition data -----------------------
-    rows = group_into_rows(rec_polys, rec_texts, rec_scores)
-    nutrition = extract_nutrition_wide(rows)
-
-    # --- Write wide CSV ---------------------------------------------------
-    suffix = "" if len(output) == 1 else f"_page_{index + 1}"
-    csv_path = output_dir / f"{base_name}{suffix}.csv"
-
-    headers = list(nutrition.keys())
-    values = list(nutrition.values())
-
-    with csv_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        writer.writerow(values)
-
-    # --- Print preview ----------------------------------------------------
-    print(f"\n[OK] Output saved: {csv_path}")
-    print(f"\n{'=' * 70}")
-    print(f"  PREVIEW - {base_name}")
-    print(f"{'=' * 70}")
-    # Print as a readable key-value list
-    for h, v in zip(headers, values):
-        print(f"  {h:<30s}  {v}")
-    print(f"{'=' * 70}")
+print(f"\n[OK] Output saved: {csv_path}")
+print(f"\n{'=' * 70}")
+print(f"  SOURCE USED: {chosen_source.name}")
+print(f"  PREVIEW - {input_image.stem}")
+print(f"{'=' * 70}")
+for h, v in zip(headers, values):
+    print(f"  {h:<30s}  {v}")
+print(f"{'=' * 70}")
