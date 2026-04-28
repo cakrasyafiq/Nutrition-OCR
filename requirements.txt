@@ -1,2 +1,7 @@
 paddlepaddle
 paddleocr[all]
+fastapi
+uvicorn[standard]
+python-multipart
+ultralytics
+huggingface_hub
