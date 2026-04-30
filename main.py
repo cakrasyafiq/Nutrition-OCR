@@ -55,9 +55,14 @@ class DetectionInfo(BaseModel):
     detection_confidence: float | None = None
 
 
+class NutritionValue(BaseModel):
+    value: str
+    unit: str
+
+
 class NutritionResult(BaseModel):
     """Structured extraction result."""
-    nutrition: dict[str, str]
+    nutrition: dict[str, NutritionValue]
     confidence: float
     fields_extracted: int
     source_used: str
@@ -88,16 +93,16 @@ async def extract_nutrition(
 
     Accepts common image formats (PNG, JPEG, BMP, TIFF, WebP).
     Returns structured JSON with nutrient names as keys and their
-    extracted values.
+    extracted value/unit pairs.
 
     Example response:
     ```json
     {
         "nutrition": {
-            "Takaran Saji": "200ml",
-            "Energi Total": "180",
-            "Protein": "6",
-            "Lemak Total": "7"
+            "Takaran Saji": {"value": "200", "unit": "ml"},
+            "Energi Total": {"value": "180", "unit": "kcal"},
+            "Protein": {"value": "6", "unit": "g"},
+            "Lemak Total": {"value": "7", "unit": "g"}
         },
         "confidence": 0.9521,
         "fields_extracted": 14,

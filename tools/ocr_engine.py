@@ -22,6 +22,7 @@ import tempfile
 import shutil
 
 from tools.detector import detect_and_crop
+from tools.nutrition_units import DEFAULT_UNITS
 
 logger = logging.getLogger("nutrition_ocr_engine")
 
@@ -214,6 +215,74 @@ SKIP_PATTERNS = [
     r"^%\s*akg",
 ]
 
+_UNIT_ALIASES = {
+    "kkal": "kcal",
+    "kal": "kcal",
+    "ug": "mcg",
+}
+
+_UNIT_PATTERN = r"(?:kkal|kcal|kal|kj|mg|g|mcg|ug|ml|l|oz|%)"
+_VALUE_UNIT_RE = re.compile(
+    rf"(\d+(?:[\.,]\d+)?)\s*({_UNIT_PATTERN})?",
+    re.I,
+)
+_UNIT_ONLY_RE = re.compile(rf"^\s*({_UNIT_PATTERN})\s*$", re.I)
+
+
+
+def _normalize_unit(unit: str) -> str:
+    if not unit:
+        return ""
+    unit_lower = unit.lower()
+    return _UNIT_ALIASES.get(unit_lower, unit_lower)
+
+
+def _extract_value_unit_from_text(text: str) -> tuple[str, str]:
+    cleaned = text.replace(",", ".")
+    m = _VALUE_UNIT_RE.search(cleaned)
+    if not m:
+        return "", ""
+    value = m.group(1)
+    unit = _normalize_unit(m.group(2) or "")
+    return value, unit
+
+
+def _extract_unit_only(text: str) -> str:
+    m = _UNIT_ONLY_RE.match(text.strip())
+    return _normalize_unit(m.group(1)) if m else ""
+
+
+def _combine_value_unit(value: str, unit: str) -> str:
+    return f"{value}{unit}" if unit else value
+
+
+def _extract_value_with_unit_from_text(text: str) -> str:
+    value, unit = _extract_value_unit_from_text(text)
+    return _combine_value_unit(value, unit) if value else ""
+
+
+def _extract_value_with_unit_from_tokens(tokens: list[str]) -> str:
+    for idx, token in enumerate(tokens):
+        if _looks_like_percent_token(token):
+            continue
+        if _is_numeric_like_token(token):
+            value, unit = _extract_value_unit_from_text(token)
+            if value:
+                if not unit and idx + 1 < len(tokens):
+                    unit = _extract_unit_only(tokens[idx + 1])
+                return _combine_value_unit(value, unit)
+
+    for idx, token in enumerate(tokens):
+        if _looks_like_percent_token(token):
+            continue
+        value, unit = _extract_value_unit_from_text(token)
+        if value:
+            if not unit and idx + 1 < len(tokens):
+                unit = _extract_unit_only(tokens[idx + 1])
+            return _combine_value_unit(value, unit)
+
+    return ""
+
 
 def _extract_numeric(text):
     """Extract the first numeric value from text (int or float).
@@ -296,24 +365,14 @@ def _extract_aligned_value(row, col_name, patterns):
         candidate_merged = " ".join(candidate_texts)
         return _extract_serving_count(candidate_merged) or _extract_serving_count(merged_row)
 
-    # Prefer numeric-like tokens on the right side of the key.
-    for token in candidate_texts:
-        if _looks_like_percent_token(token):
-            continue
-        if _is_numeric_like_token(token):
-            value = _extract_numeric_from_token(token)
-            if value:
-                return value
+    value = _extract_value_with_unit_from_tokens(candidate_texts)
+    if value:
+        return value
 
-    # Fallback: any non-percent token containing digits on the right side.
-    for token in candidate_texts:
-        if _looks_like_percent_token(token):
-            continue
-        value = _extract_numeric_from_token(token)
-        if value:
-            return value
+    value = _extract_value_with_unit_from_text(merged_row)
+    if value:
+        return value
 
-    # Last fallback: extract from full row text.
     return _extract_numeric(merged_row)
 
 
@@ -440,6 +499,21 @@ def _candidate_rank(candidate):
     )
 
 
+def _structure_nutrition(nutrition: dict[str, str]) -> dict[str, dict[str, str]]:
+    structured = {}
+    for key, raw_value in nutrition.items():
+        value, unit = _extract_value_unit_from_text(str(raw_value))
+        if value and not unit:
+            unit = DEFAULT_UNITS.get(key, "")
+        if not value:
+            unit = ""
+        structured[key] = {
+            "value": value,
+            "unit": unit,
+        }
+    return structured
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -459,7 +533,11 @@ def extract_nutrition_from_image(image_path: str | Path) -> dict:
     -------
     dict
         {
-            "nutrition": { "Energi Total": "180", "Protein": "6", … },
+            "nutrition": {
+                "Energi Total": {"value": "180", "unit": "kcal"},
+                "Protein": {"value": "6", "unit": "g"},
+                …
+            },
             "confidence": 0.95,
             "fields_extracted": 14,
             "source_used": "preprocessed" | "original",
@@ -514,10 +592,17 @@ def extract_nutrition_from_image(image_path: str | Path) -> dict:
                 detection_info["confidence"], 4
             )
 
+        structured_nutrition = _structure_nutrition(best_candidate["nutrition"])
+        fields_extracted = sum(
+            1
+            for item in structured_nutrition.values()
+            if str(item.get("value", "")).strip()
+        )
+
         return {
-            "nutrition": best_candidate["nutrition"],
+            "nutrition": structured_nutrition,
             "confidence": round(best_candidate["avg_score"], 4),
-            "fields_extracted": best_candidate["non_empty"],
+            "fields_extracted": fields_extracted,
             "source_used": source_used,
             "detection": detection_meta,
         }
