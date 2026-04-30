@@ -26,7 +26,10 @@ logger = logging.getLogger("nutrition_detector")
 
 MODEL_REPO = "openfoodfacts/nutrition-table-yolo"
 MODEL_FILENAME = "weights/best.pt"          # path inside the HF repo
-LOCAL_MODEL_DIR = Path(__file__).parent / "models"
+BASE_DIR = Path(__file__).resolve().parents[1]
+LOCAL_MODEL_DIR = BASE_DIR / "models"
+LOCAL_WEIGHT_PATH = LOCAL_MODEL_DIR / "weights" / "best.pt"
+LEGACY_WEIGHT_PATH = LOCAL_MODEL_DIR / "best.pt"
 
 _yolo_model: YOLO | None = None
 
@@ -37,11 +40,12 @@ def get_model() -> YOLO:
     if _yolo_model is not None:
         return _yolo_model
 
-    # The HF hub may place the file under a weights/ subdirectory; we
-    # resolve the final path after download.
-    target_path = LOCAL_MODEL_DIR / "best.pt"
-
-    if not target_path.exists():
+    # The HF hub stores the file under weights/best.pt by default.
+    if LOCAL_WEIGHT_PATH.exists():
+        target_path = LOCAL_WEIGHT_PATH
+    elif LEGACY_WEIGHT_PATH.exists():
+        target_path = LEGACY_WEIGHT_PATH
+    else:
         LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         logger.info("Downloading nutrition-table detection model from %s …", MODEL_REPO)
 
@@ -50,7 +54,6 @@ def get_model() -> YOLO:
             filename=MODEL_FILENAME,
             local_dir=str(LOCAL_MODEL_DIR),
         )
-        # huggingface_hub may keep the weights/ subfolder locally
         target_path = Path(downloaded_path)
         logger.info("Model cached at %s", target_path)
 

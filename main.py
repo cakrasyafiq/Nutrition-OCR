@@ -16,7 +16,7 @@ import shutil
 import time
 import logging
 
-from ocr_engine import extract_nutrition_from_image
+from tools.ocr_engine import extract_nutrition_from_image
 
 # ---------------------------------------------------------------------------
 # Logging

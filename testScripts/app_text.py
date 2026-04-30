@@ -1,53 +1,22 @@
-"""
-Nutrition OCR Engine
-====================
-Core extraction logic refactored from app_text.py into an importable module.
-Provides `extract_nutrition_from_image()` as the main entry point.
-
-Pipeline:
-    1. Detect nutrition table region (YOLO) → crop
-    2. Preprocess cropped image (upscale, denoise, binarize)
-    3. Run PaddleOCR on both original crop and preprocessed version
-    4. Return best extraction
-"""
-
 from paddleocr import PaddleOCR
 from pathlib import Path
 import json
-import logging
+import csv
 import re
 import cv2
 import numpy as np
-import tempfile
-import shutil
-
-from detector import detect_and_crop
-
-logger = logging.getLogger("nutrition_ocr_engine")
 
 # ---------------------------------------------------------------------------
-# OCR setup (initialized once at module level)
+# OCR setup
 # ---------------------------------------------------------------------------
-_ocr_instance: PaddleOCR | None = None
+ocr = PaddleOCR(
+    text_detection_model_name="PP-OCRv5_mobile_det",
+    text_recognition_model_name="PP-OCRv5_mobile_rec",
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+)
 
-
-def get_ocr() -> PaddleOCR:
-    """Lazy-initialize the PaddleOCR model (heavy, only load once)."""
-    global _ocr_instance
-    if _ocr_instance is None:
-        _ocr_instance = PaddleOCR(
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="PP-OCRv5_mobile_rec",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
-    return _ocr_instance
-
-
-# ---------------------------------------------------------------------------
-# Image preprocessing
-# ---------------------------------------------------------------------------
 
 def preprocess_for_ocr(image_path: Path, output_dir: Path) -> Path:
     """Preprocess input image to improve OCR detection/recognition quality."""
@@ -90,6 +59,82 @@ def preprocess_for_ocr(image_path: Path, output_dir: Path) -> Path:
     preprocessed_path = output_dir / f"{image_path.stem}_preprocessed.png"
     cv2.imwrite(str(preprocessed_path), processed)
     return preprocessed_path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+input_image = BASE_DIR / "test_files" / "test_gizi_3.png"
+output_dir = BASE_DIR / "output"
+output_dir.mkdir(parents=True, exist_ok=True)
+preprocessed_image = preprocess_for_ocr(input_image, output_dir)
+
+
+def run_ocr_extract_nutrition(source_image: Path, output_dir: Path):
+    """Run OCR for one source image and return extracted nutrition + diagnostics."""
+    output = list(ocr.predict(str(source_image)))
+
+    all_nutrition = []
+    all_scores = []
+
+    for res in output:
+        res.save_to_json(str(output_dir))
+
+        rec_texts = []
+        rec_scores = []
+        rec_polys = []
+
+        result_data = getattr(res, "res", None)
+        if isinstance(result_data, dict):
+            rec_texts = result_data.get("rec_texts", [])
+            rec_scores = result_data.get("rec_scores", [])
+            rec_polys = result_data.get("rec_polys", []) or result_data.get("dt_polys", [])
+
+        # Fallback: read generated JSON for this specific source image.
+        if not rec_texts:
+            json_path = output_dir / f"{source_image.stem}_res.json"
+            if json_path.exists():
+                with json_path.open("r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                rec_texts = payload.get("rec_texts", [])
+                rec_scores = payload.get("rec_scores", [])
+                rec_polys = payload.get("rec_polys", []) or payload.get("dt_polys", [])
+
+        if not rec_scores:
+            rec_scores = [1.0] * len(rec_texts)
+        if not rec_polys:
+            rec_polys = [
+                [[0, i * 100], [100, i * 100], [100, i * 100 + 50], [0, i * 100 + 50]]
+                for i in range(len(rec_texts))
+            ]
+
+        rows = group_into_rows(rec_polys, rec_texts, rec_scores)
+        nutrition = extract_nutrition_wide(rows)
+        all_nutrition.append(nutrition)
+        all_scores.extend(rec_scores)
+
+    # Keep best page for single-image usage by maximizing non-empty extracted values.
+    best_nutrition = {}
+    best_non_empty = -1
+    for nutrition in all_nutrition:
+        non_empty = sum(1 for v in nutrition.values() if str(v).strip())
+        if non_empty > best_non_empty:
+            best_non_empty = non_empty
+            best_nutrition = nutrition
+
+    avg_score = (sum(all_scores) / len(all_scores)) if all_scores else 0.0
+    return {
+        "nutrition": best_nutrition,
+        "avg_score": avg_score,
+        "non_empty": best_non_empty,
+    }
+
+
+def candidate_rank(candidate):
+    """Rank candidate by extraction completeness first, confidence second."""
+    nutrition = candidate["nutrition"]
+    return (
+        candidate["non_empty"],
+        len(nutrition),
+        candidate["avg_score"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,159 +412,43 @@ def extract_nutrition_wide(rows):
 
 
 # ---------------------------------------------------------------------------
-# Internal OCR runner
+# Run OCR candidates and choose best extraction
 # ---------------------------------------------------------------------------
+original_candidate = run_ocr_extract_nutrition(input_image, output_dir)
+preprocessed_candidate = run_ocr_extract_nutrition(preprocessed_image, output_dir)
 
-def _run_ocr_extract_nutrition(ocr: PaddleOCR, source_image: Path, work_dir: Path):
-    """Run OCR for one source image and return extracted nutrition + diagnostics."""
-    output = list(ocr.predict(str(source_image)))
+best_candidate = max(
+    [original_candidate, preprocessed_candidate],
+    key=candidate_rank,
+)
 
-    all_nutrition = []
-    all_scores = []
+nutrition = best_candidate["nutrition"]
 
-    for res in output:
-        res.save_to_json(str(work_dir))
-
-        rec_texts = []
-        rec_scores = []
-        rec_polys = []
-
-        result_data = getattr(res, "res", None)
-        if isinstance(result_data, dict):
-            rec_texts = result_data.get("rec_texts", [])
-            rec_scores = result_data.get("rec_scores", [])
-            rec_polys = result_data.get("rec_polys", []) or result_data.get("dt_polys", [])
-
-        # Fallback: read generated JSON for this specific source image.
-        if not rec_texts:
-            json_path = work_dir / f"{source_image.stem}_res.json"
-            if json_path.exists():
-                with json_path.open("r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                rec_texts = payload.get("rec_texts", [])
-                rec_scores = payload.get("rec_scores", [])
-                rec_polys = payload.get("rec_polys", []) or payload.get("dt_polys", [])
-
-        if not rec_scores:
-            rec_scores = [1.0] * len(rec_texts)
-        if not rec_polys:
-            rec_polys = [
-                [[0, i * 100], [100, i * 100], [100, i * 100 + 50], [0, i * 100 + 50]]
-                for i in range(len(rec_texts))
-            ]
-
-        rows = group_into_rows(rec_polys, rec_texts, rec_scores)
-        nutrition = extract_nutrition_wide(rows)
-        all_nutrition.append(nutrition)
-        all_scores.extend(rec_scores)
-
-    # Keep best page for single-image usage by maximizing non-empty extracted values.
-    best_nutrition = {}
-    best_non_empty = -1
-    for nutrition in all_nutrition:
-        non_empty = sum(1 for v in nutrition.values() if str(v).strip())
-        if non_empty > best_non_empty:
-            best_non_empty = non_empty
-            best_nutrition = nutrition
-
-    avg_score = (sum(all_scores) / len(all_scores)) if all_scores else 0.0
-    return {
-        "nutrition": best_nutrition,
-        "avg_score": avg_score,
-        "non_empty": best_non_empty,
-    }
-
-
-def _candidate_rank(candidate):
-    """Rank candidate by extraction completeness first, confidence second."""
-    nutrition = candidate["nutrition"]
-    return (
-        candidate["non_empty"],
-        len(nutrition),
-        candidate["avg_score"],
-    )
+# Keep result artifacts from the chosen source for easy visual inspection.
+chosen_source = input_image if best_candidate is original_candidate else preprocessed_image
+chosen_output = list(ocr.predict(str(chosen_source)))
+for res in chosen_output:
+    res.save_to_img(str(output_dir))
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Write output from best candidate
 # ---------------------------------------------------------------------------
+csv_path = output_dir / f"{input_image.stem}.csv"
 
-def extract_nutrition_from_image(image_path: str | Path) -> dict:
-    """Extract structured nutrition data from an image file.
+headers = list(nutrition.keys())
+values = list(nutrition.values())
 
-    Pipeline:
-        1. **Detect** the nutrition table region using YOLO.
-        2. **Crop** the detected region (with padding); fall back to the
-           full image when no table is found.
-        3. **Preprocess** the crop (upscale, denoise, binarize).
-        4. **OCR** both the raw crop and the preprocessed version.
-        5. Return the best extraction.
+with csv_path.open("w", encoding="utf-8", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(headers)
+    writer.writerow(values)
 
-    Returns
-    -------
-    dict
-        {
-            "nutrition": { "Energi Total": "180", "Protein": "6", … },
-            "confidence": 0.95,
-            "fields_extracted": 14,
-            "source_used": "preprocessed" | "original",
-            "detection": {
-                "detected": True,
-                "bbox": [x1, y1, x2, y2],
-                "detection_confidence": 0.87
-            }
-        }
-    """
-    image_path = Path(image_path)
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    ocr = get_ocr()
-
-    # Use a temp directory for intermediate artifacts
-    work_dir = Path(tempfile.mkdtemp(prefix="nutrition_ocr_"))
-    try:
-        # ----- Step 1: Detect & crop nutrition table -----
-        cropped_path, detection_info = detect_and_crop(
-            image_path, work_dir, confidence=0.3, padding_ratio=0.05,
-        )
-        table_detected = detection_info is not None
-        logger.info(
-            "Detection stage: %s (image=%s)",
-            "table found" if table_detected else "no table — using full image",
-            image_path.name,
-        )
-
-        # ----- Step 2: Preprocess the (possibly cropped) image -----
-        preprocessed_path = preprocess_for_ocr(cropped_path, work_dir)
-
-        # ----- Step 3: OCR on both versions, pick best -----
-        original_candidate = _run_ocr_extract_nutrition(ocr, cropped_path, work_dir)
-        preprocessed_candidate = _run_ocr_extract_nutrition(ocr, preprocessed_path, work_dir)
-
-        best_candidate = max(
-            [original_candidate, preprocessed_candidate],
-            key=_candidate_rank,
-        )
-
-        source_used = (
-            "original" if best_candidate is original_candidate else "preprocessed"
-        )
-
-        # Build detection metadata for the response
-        detection_meta: dict = {"detected": table_detected}
-        if detection_info is not None:
-            detection_meta["bbox"] = list(detection_info["bbox"])
-            detection_meta["detection_confidence"] = round(
-                detection_info["confidence"], 4
-            )
-
-        return {
-            "nutrition": best_candidate["nutrition"],
-            "confidence": round(best_candidate["avg_score"], 4),
-            "fields_extracted": best_candidate["non_empty"],
-            "source_used": source_used,
-            "detection": detection_meta,
-        }
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+print(f"\n[OK] Output saved: {csv_path}")
+print(f"\n{'=' * 70}")
+print(f"  SOURCE USED: {chosen_source.name}")
+print(f"  PREVIEW - {input_image.stem}")
+print(f"{'=' * 70}")
+for h, v in zip(headers, values):
+    print(f"  {h:<30s}  {v}")
+print(f"{'=' * 70}")
